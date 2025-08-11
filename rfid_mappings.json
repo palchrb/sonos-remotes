@@ -1,0 +1,62 @@
+{
+    "9A748905000000000000": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/show/6bnftUkxRirEsV64xhwTDN?si=8bf781e8301048fb"
+    },
+    "1B43934F000000000000": {
+        "type": "program",
+        "media": "https://radio.nrk.no/serie/ninas-hemmelige-reise/sesong/1/MKTT81008181"
+    },
+    "AB42974F000000000000": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/playlist/6BLoPpXQXX6xBNisPVMWIN?si=yGapKIonTDqd9VaE3cmBTg&pi=9hvCAujwT6-3I"
+    },
+    "3BF4784F000000000000": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/show/6bnftUkxRirEsV64xhwTDN?si=9LsIZIO_SXiZor22SW55tw"
+    },
+    "0B20D44F000000000000": {
+        "type": "podcast",
+        "media": "fantorangens_vitseshow.xml"
+    },
+    "EB5B994F000000000000": {
+        "type": "podcast",
+        "media": "fantorangenfortellinger.xml"
+    },
+    "DB0AA14F000000000000": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/playlist/59TZ842IvpS22fbyIEDoFq?si=lPQfH3pYRoOJIARYN5YoiA&pi=9V-YgoywSR6PO"
+    },
+    "9BE3F44F000000000000": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/album/0mzEAmWgr0E15OOxMgGFAc?si=e-S20Oj3QDSe0AVwRKR0Dg"
+    },
+    "9B8B644F000000000000": {
+        "type": "podcast",
+        "media": "hallo_bablo.xml"
+    },
+    "CB5E884F000000000000": {
+        "type": "program",
+        "media": "https://radio.nrk.no/serie/balle-frost-og-leketoeysbanditten/sesong/1/OBUR15548208"
+    },
+    "7B7E9A4F000000000000": {
+        "type": "program",
+        "media": "https://radio.nrk.no/serie/balle-frost-og-den-hvite-kamel/MKTT07003507"
+    },
+    "brightness_move_up": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/playlist/5E6tmZySzQwe88grhIrpbY?si=bFATc0rcRRqRmM62maMEsQ&pi=bqd2l-l7QKu7X"
+    },
+    "brightness_move_down": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/playlist/6BLoPpXQXX6xBNisPVMWIN?si=yGapKIonTDqd9VaE3cmBTg&pi=9hvCAujwT6-3I"
+    },
+    "arrow_left_hold": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/album/0mzEAmWgr0E15OOxMgGFAc?si=Kp6SxwsFTyaaQb3SIZqHxg"
+    },
+    "arrow_right_hold": {
+        "type": "playlink",
+        "media": "https://open.spotify.com/playlist/59TZ842IvpS22fbyIEDoFq?si=lPQfH3pYRoOJIARYN5YoiA&pi=9V-YgoywSR6PO"
+    }
+}
