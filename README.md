@@ -10,4 +10,6 @@ I have made 3 different devices; two rfid remotes based on M5Stack iot-devices: 
 What it controls is;
 - For the m5 stick it maps all speakers and allow speaker selection on the simple screen
 - Then you scan a RFID card (where the ID is mapped to a podcast or spotify sharelink), and voila
-- Then you can press "next song" 
+- Then you can press "next song"
+
+Feel free to ask questions here: **[#sonosremotes:vibb.me](https://matrix.to/#/#sonosremotes:vibb.me)**
