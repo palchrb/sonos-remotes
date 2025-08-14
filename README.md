@@ -12,4 +12,6 @@ What it controls is;
 - Then you scan a RFID card (where the ID is mapped to a podcast or spotify sharelink), and voila
 - Then you can press "next song"
 
+Updated with bearer auth (and IP whitelist with no auth), as well as possibility to play specific episodes from NRK podcasts based on a sharelink, and not just the whole show)
+
 Feel free to ask questions here: **[#sonosremotes:vibb.me](https://matrix.to/#/#sonosremotes:vibb.me)**
