@@ -1,5 +1,5 @@
 # sonos-remotes
-(almost) screen-less rfid / button based Sonos remotes for my kids
+(almost) screen-less rfid / button based Sonos remotes for my kids - This is also the backend i use for my sonos maubot plugin: https://github.com/palchrb/maubot_sonos
 
 Worth noting that per now, what it can control is to start playing any spotify sharelink, as well as podcasts/programs from Norwegian broadcaster NRK (based on https://github.com/sindrel/nrk-pod-feeds) since this is what my kids listen to! 
 
