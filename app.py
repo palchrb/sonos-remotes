@@ -23,7 +23,7 @@ import ipaddress
 from functools import wraps
 
 # Sett hemmeligheten her eller via env (ANBEFALT: SOCORFID_SECRET)
-SECRET = "secrethere"
+SECRET = os.environ.get("SOCORFID_SECRET", "secrethere")
 
 # Nett som slipper auth (LAN/Tailscale m.m.)
 TRUSTED_CIDRS = [
@@ -97,114 +97,41 @@ def get_speaker_for_device(device_id):
     mapping = load_mapping()
     return mapping.get(device_id)
 
-# --------------------------
-# LAST RFID-ENDPOINT
-# --------------------------
-@app.route("/last-rfid", methods=["GET"])
-@require_auth_or_local
-def last_rfid():
+# =====================================================
+# SERVICE-LAG (ingen Flask request/response eller auth)
+# Enhetlige returverdier: (body:dict, status_code:int)
+# =====================================================
+
+def _require_speaker_ip(device_id: str):
+    ip = get_speaker_for_device(device_id)
+    if not ip:
+        return None, ({"error": "Ingen høyttaler valgt for denne device_id"}, 400)
+    return ip, None
+
+def _prepare_sonos(ip: str):
+    sonos = SoCo(ip)
+    sonos.stop()
     try:
-        with open("last_unmapped_rfid.txt", "r") as f:
-            last = f.read().strip()
-        return jsonify({"last_rfid": last})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        sonos.avTransport.EndDirectControlSession([("InstanceID", 0)])
+    except Exception:
+        pass
+    sonos.clear_queue()
+    return sonos
 
-# --------------------------
-# HENTING AV HØYTTALERE & VALG
-# --------------------------
-def discover_speakers():
-    found = discover()
-    speakers = {}
-    if found:
-        for device in found:
-            # Hvis enheten er del av en gruppe, bruk koordinatorens navn og IP
-            coordinator = device.group.coordinator
-            if coordinator:
-                speakers[coordinator.player_name] = coordinator.ip_address
-            else:
-                speakers[device.player_name] = device.ip_address
-    return speakers
-
-
-@app.route("/speakers", methods=["GET"])
-@require_auth_or_local
-def get_speakers_endpoint():
-    speakers = discover_speakers()
-    return jsonify(speakers)
-
-@app.route("/set_speaker", methods=["POST"])
-@require_auth_or_local
-def set_speaker_endpoint():
-    data = request.json
-    device_id = data.get("device_id")
-    if not device_id:
-        return jsonify({"error": "device_id mangler"}), 400
-
-    speakers = discover_speakers()
-    if "speaker" in data:
-        name = data["speaker"]
-        if name not in speakers:
-            return jsonify({"error": "Ukjent høyttaler"}), 400
-        chosen_ip = speakers[name]
-    elif "ip" in data:
-        chosen_ip = data["ip"]
-    else:
-        return jsonify({"error": "Mangler speaker/ip"}), 400
-
-    set_speaker_for_device(device_id, chosen_ip)
-    return jsonify({"status": "Høyttaler oppdatert", "device_id": device_id, "ip": chosen_ip})
-
-# Funksjoner for interne kall (brukes i play_by_card)
-def play_playlink_internal(payload):
-    with app.test_request_context(json=payload):
-        return play_playlink()
-
-def play_nrk_program_internal(payload):
-    with app.test_request_context(json=payload):
-        return play_nrk_program()
-
-def play_nrk_podcast_internal(payload):
-    with app.test_request_context(json=payload):
-        return play_nrk_podcast()
-
-# --------------------------
-# AVSPILLING VIA SPOTIFY PLAYLINK
-# --------------------------
-@app.route("/play/playlink", methods=["POST"])
-@require_auth_or_local
-def play_playlink():
-    data = request.json
-    device_id = data.get("device_id")
-    media = data.get("media")
-    if not device_id:
-        return jsonify({"error": "device_id mangler"}), 400
-    if not media:
-        return jsonify({"error": "media (Spotify-playlink) mangler"}), 400
-
-    speaker_ip = get_speaker_for_device(device_id)
-    if not speaker_ip:
-        return jsonify({"error": "Ingen høyttaler valgt for denne device_id"}), 400
-
+# ---------- PlayLink ----------
+def svc_play_playlink(device_id: str, media: str):
+    ip, err = _require_speaker_ip(device_id)
+    if err: return err
     try:
-        sonos = SoCo(speaker_ip)
-        sonos.stop()
-        try:
-            sonos.avTransport.EndDirectControlSession([("InstanceID", 0)])
-        except Exception as e:
-            print("Ingen direkte kontrollsession å avslutte, fortsetter...", e)
-        sonos.clear_queue()
+        sonos = _prepare_sonos(ip)
         plugin = ShareLinkPlugin(sonos)
         queue_position = plugin.add_share_link_to_queue(media)
-        print("Element lagt til køen på posisjon:", queue_position)
         sonos.play_from_queue(0, start=True)
-        return jsonify({"status": "Avspilling startet via PlayLink", "position": queue_position})
+        return ({"status": "Avspilling startet via PlayLink", "position": queue_position}, 200)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return ({"error": str(e)}, 500)
 
-# --------------------------
-# HJELPEFUNKSJONER FOR NRK-PROGRAM
-# --------------------------
+# ---------- NRK Program (serie) ----------
 def iso_duration_to_hms(iso_duration):
     pattern = re.compile(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?')
     match = pattern.match(iso_duration)
@@ -257,14 +184,13 @@ def build_didl_metadata(sonos_uri, metadata_api):
     )
     return didl_metadata
 
-def play_nrk_series(nrk_url, speaker_ip):
+def _build_nrk_series_queue(nrk_url):
     episodes = []
     series_name = nrk_url.rstrip('/').split('/')[-2]
     current_url = nrk_url
 
     while True:
         current_program_id = get_program_id(current_url)
-        print(f"Henter data for program: {current_program_id}")
         sonos_uri = generate_sonos_uri(current_url, current_program_id)
         metadata_api = fetch_nrk_metadata(current_program_id)
         didl_metadata = build_didl_metadata(sonos_uri, metadata_api)
@@ -278,57 +204,33 @@ def play_nrk_series(nrk_url, speaker_ip):
                 next_href = next_dict.get("href")
         
         if not next_href:
-            print("Ingen flere 'next'-episoder funnet.")
             break
         
         next_program_id = next_href.split("/")[-1]
         current_url = f"https://radio.nrk.no/serie/{series_name}/{next_program_id}"
-        print(f"Neste episode: {next_program_id}")
 
-    sonos = SoCo(speaker_ip)
-    sonos.stop()
+    return episodes
+
+def svc_play_nrk_program(device_id: str, nrk_url: str):
+    ip, err = _require_speaker_ip(device_id)
+    if err: return err
     try:
-        sonos.avTransport.EndDirectControlSession([("InstanceID", 0)])
+        episodes = _build_nrk_series_queue(nrk_url)
+        sonos = _prepare_sonos(ip)
+        for (uri, metadata) in episodes:
+            sonos.avTransport.AddURIToQueue([
+                ("InstanceID", 0),
+                ("EnqueuedURI", uri),
+                ("EnqueuedURIMetaData", metadata),
+                ("DesiredFirstTrackNumberEnqueued", 0),
+                ("EnqueueAsNext", 0),
+            ])
+        sonos.play_from_queue(0, start=True)
+        return ({"status": "Avspilling startet fra NRK program", "antall_episoder": len(episodes)}, 200)
     except Exception as e:
-        print("Ingen direkte kontrollsession å avslutte, fortsetter...", e)
-    sonos.clear_queue()
-    print("Køen ble tømt.")
+        return ({"error": str(e)}, 500)
 
-    for idx, (uri, metadata) in enumerate(episodes):
-        print(f"Legger til episode {idx+1}: {uri}")
-        sonos.avTransport.AddURIToQueue([
-            ("InstanceID", 0),
-            ("EnqueuedURI", uri),
-            ("EnqueuedURIMetaData", metadata),
-            ("DesiredFirstTrackNumberEnqueued", 0),
-            ("EnqueueAsNext", 0),
-        ])
-    
-    sonos.play_from_queue(0, start=True)
-    return {"status": "Avspilling startet fra NRK program", "antall_episoder": len(episodes)}
-
-@app.route("/play/nrk_program", methods=["POST"])
-@require_auth_or_local
-def play_nrk_program():
-    data = request.json
-    device_id = data.get("device_id")
-    media = data.get("media")  # For NRK-program, media tolkes som NRK-URL
-    if not device_id:
-        return jsonify({"error": "device_id mangler"}), 400
-    if not media:
-        return jsonify({"error": "media (NRK-URL) mangler i request"}), 400
-    speaker_ip = get_speaker_for_device(device_id)
-    if not speaker_ip:
-        return jsonify({"error": "Ingen høyttaler valgt for denne device_id"}), 400
-    try:
-        result = play_nrk_series(media, speaker_ip)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# --------------------------
-# NRK PODCAST: serie (.xml) ELLER enkel episode (episode-URL)
-# --------------------------
+# ---------- NRK Podcast ----------
 import html
 import unicodedata
 
@@ -392,31 +294,14 @@ def find_enclosure_by_title(xml_path, wanted_title):
 
     raise ValueError("Episoden ble ikke funnet i XML.")
 
-@app.route("/play/nrk_podcast", methods=["POST"])
-@require_auth_or_local
-def play_nrk_podcast():
-    data = request.json
-    device_id = data.get("device_id")
-    media = data.get("media")  # Kan være "<slug>.xml" ELLER full episode-URL
-    if not device_id:
-        return jsonify({"error": "device_id mangler"}), 400
-    if not media:
-        return jsonify({"error": "media (XML-filnavn ELLER episode-URL) mangler i request"}), 400
-    speaker_ip = get_speaker_for_device(device_id)
-    if not speaker_ip:
-        return jsonify({"error": "Ingen høyttaler valgt for denne device_id"}), 400
-    
+def svc_play_nrk_podcast(device_id: str, media: str):
+    ip, err = _require_speaker_ip(device_id)
+    if err: return err
     try:
         # Detekter episode-URL
         m_ep = re.match(r'^https?://radio\.nrk\.no/podkast/([a-z0-9_]+)/([A-Za-z0-9_-]+)$', media, re.IGNORECASE)
 
-        sonos = SoCo(speaker_ip)
-        sonos.stop()
-        try:
-            sonos.avTransport.EndDirectControlSession([("InstanceID", 0)])
-        except Exception:
-            pass
-        sonos.clear_queue()
+        sonos = _prepare_sonos(ip)
 
         if m_ep:
             # Enkel episode
@@ -452,7 +337,7 @@ def play_nrk_podcast():
                 ("EnqueueAsNext", 0),
             ])
             sonos.play_from_queue(0, start=True)
-            return jsonify({"status": "NRK episode-avspilling startet", "episode_title": meta["title"], "mp3": mp3_url})
+            return ({"status": "NRK episode-avspilling startet", "episode_title": meta["title"], "mp3": mp3_url}, 200)
 
         # Ellers: hele feeden fra XML-fil (eksisterende oppførsel)
         full_path = os.path.join(PODCAST_FEED_DIR, media)
@@ -462,10 +347,10 @@ def play_nrk_podcast():
         root = ET.fromstring(xml_content)
         items = root.findall("./channel/item")
         if not items:
-            return jsonify({"error": "Ingen episoder funnet i feeden"}), 500
+            return ({"error": "Ingen episoder funnet i feeden"}, 500)
 
-        episodes = []
         ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+        count = 0
         for item in items:
             title_el = item.find("title")
             title = title_el.text if title_el is not None else "Ukjent tittel"
@@ -478,47 +363,283 @@ def play_nrk_podcast():
             image_el = item.find("itunes:image", ns)
             album_art = image_el.attrib.get("href") if image_el is not None else ""
             
-            episodes.append({
-                "title": title,
-                "podcast_episode_url": podcast_episode_url,
-                "duration": duration,
-                "album_art": album_art
-            })
-        
-        if not episodes:
-            return jsonify({"error": "Ingen gyldige episoder funnet i feeden"}), 500
-        
-        for idx, ep in enumerate(episodes):
             metadata = (
                 '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
                 'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
                 'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" '
                 'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
                 '<item id="-1" parentID="-1" restricted="true">'
-                '<res protocolInfo="sonos.com-http:*:audio/mpeg:*" duration="{duration}">{uri}</res>'
-                '<dc:title>{title}</dc:title>'
-                '<upnp:albumArtURI>{album_art}</upnp:albumArtURI>'
+                f'<res protocolInfo="sonos.com-http:*:audio/mpeg:*" duration="{saxutils.escape(duration)}">{saxutils.escape(podcast_episode_url)}</res>'
+                f'<dc:title>{saxutils.escape(title)}</dc:title>'
+                f'<upnp:albumArtURI>{saxutils.escape(album_art)}</upnp:albumArtURI>'
                 '<upnp:class>object.item.audioItem.show</upnp:class>'
                 '</item>'
                 '</DIDL-Lite>'
-            ).format(
-                duration=saxutils.escape(ep["duration"]),
-                uri=saxutils.escape(ep["podcast_episode_url"]),
-                title=saxutils.escape(ep["title"]),
-                album_art=saxutils.escape(ep["album_art"])
             )
             sonos.avTransport.AddURIToQueue([
                 ("InstanceID", 0),
-                ("EnqueuedURI", ep["podcast_episode_url"]),
+                ("EnqueuedURI", podcast_episode_url),
                 ("EnqueuedURIMetaData", metadata),
                 ("DesiredFirstTrackNumberEnqueued", 0),
                 ("EnqueueAsNext", 0),
             ])
+            count += 1
         sonos.play_from_queue(0, start=True)
-        return jsonify({"status": "NRK podcast-avspilling startet", "antall_episoder": len(episodes)})
+        return ({"status": "NRK podcast-avspilling startet", "antall_episoder": count}, 200)
+    except Exception as e:
+        return ({"error": str(e)}, 500)
+
+# ---------- Stream ----------
+def _resolve_stream_url(uri: str, timeout=6) -> tuple[str, str]:
+    """Følg .pls/.m3u(.8) og HTTP-redirects. Returner (final_url, content_type_lc)."""
+    low = uri.lower()
+    if low.endswith((".pls", ".m3u", ".m3u8")):
+        r = requests.get(uri, timeout=timeout)
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("http://") or s.startswith("https://"):
+                uri = s
+                break
+
+    # HEAD for å finne endelig URL + Content-Type (fall back til GET om HEAD feiler)
+    try:
+        h = requests.head(uri, allow_redirects=True, timeout=timeout)
+        final = h.url
+        ctype = (h.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except Exception:
+        g = requests.get(uri, allow_redirects=True, timeout=timeout)
+        final = g.url
+        ctype = (g.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    return final, ctype
+
+def _didl_for_stream(title: str, uri: str, mime: str) -> str:
+    # NB: bruker saxutils.escape fra din eksisterende import
+    return (
+        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" '
+        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+        '<item id="-1" parentID="-1" restricted="true">'
+        f'<dc:title>{saxutils.escape(title)}</dc:title>'
+        '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
+        f'<res protocolInfo="http-get:*:{saxutils.escape(mime)}:*">{saxutils.escape(uri)}</res>'
+        '</item>'
+        '</DIDL-Lite>'
+    )
+
+def _sniff_magic(uri: str, timeout=6) -> str | None:
+    """
+    Returner 'ogg_vorbis' | 'ogg_opus' | 'mp3' | 'aac' | None
+    """
+    try:
+        for start in (0, 4096, 8192):
+            r = requests.get(
+                uri,
+                headers={"Range": f"bytes={start}-{start+4095}"},
+                stream=True, allow_redirects=True, timeout=timeout
+            )
+            r.raise_for_status()
+            chunk = next(r.iter_content(chunk_size=4096), b"")
+            if not chunk:
+                continue
+
+            head = chunk[:64]
+
+            # Ogg container
+            if b"OggS" in chunk:
+                if b"OpusHead" in chunk:
+                    return "ogg_opus"
+                if b"vorbis" in chunk:
+                    return "ogg_vorbis"
+                return "ogg"
+
+            # MP3: ID3 header eller MPEG frame sync 0xFFEx
+            if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+                return "mp3"
+
+            # AAC (ADTS): sync 0xFFF1 eller 0xFFF9
+            if len(head) >= 2 and head[0] == 0xFF and head[1] in (0xF1, 0xF9):
+                return "aac"
+
+            # MP4/AAC-in-ISO (m4a/mp4) – grov sniff
+            if b"ftypM4A" in head or b"mp42" in head or b"isom" in head:
+                return "aac"
+    except Exception:
+        pass
+    return None
+
+def svc_play_stream(device_id: str, uri: str):
+    ip, err = _require_speaker_ip(device_id)
+    if err: return err
+    try:
+        final_uri, ctype = _resolve_stream_url(uri)
+        ctype = (ctype or "").lower()
+        ulow = final_uri.lower()
+
+        kind = _sniff_magic(final_uri)  # 'mp3' | 'aac' | 'ogg_vorbis' | 'ogg_opus' | None
+
+        # Bestem MIME vi vil annonsere i DIDL (behold 'aacp' hvis vi ser det)
+        decided_mime = None
+        if kind in ("ogg_vorbis",) or "ogg" in ctype or ulow.endswith(".ogg"):
+            decided_mime = "application/ogg"
+        elif kind == "aac" or "aac" in ctype or ulow.endswith((".aac", ".m4a", ".mp4")):
+            decided_mime = "audio/aacp" if "aacp" in ctype else "audio/aac"
+        elif kind == "mp3" or "mpeg" in ctype or "mp3" in ctype or ulow.endswith(".mp3"):
+            decided_mime = "audio/mpeg"
+        elif ctype in ("", "application/octet-stream"):
+            decided_mime = "audio/mpeg"   # safe default
+        else:
+            decided_mime = ctype
+
+        sonos = _prepare_sonos(ip)
+
+        # HTTP(S) – prøv radio-modus for MP3 **og AAC** først
+        if final_uri.startswith(("http://", "https://")):
+            if decided_mime in ("audio/mpeg", "audio/aac", "audio/aacp"):
+                try:
+                    sonos.play_uri(f"x-rincon-mp3radio://{final_uri}")
+                    return ({"status": f"Avspilling startet (radio mode, {decided_mime})",
+                             "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "radio"}, 200)
+                except Exception:
+                    pass  # fall back til queue + DIDL
+
+            # For Ogg/AAC/annet: queue + DIDL
+            meta = _didl_for_stream("Internet Radio", final_uri, decided_mime)
+            sonos.avTransport.AddURIToQueue([
+                ("InstanceID", 0),
+                ("EnqueuedURI", final_uri),
+                ("EnqueuedURIMetaData", meta),
+                ("DesiredFirstTrackNumberEnqueued", 0),
+                ("EnqueueAsNext", 0),
+            ])
+            sonos.play_from_queue(0, start=True)
+            return ({"status": f"Avspilling startet (queue + DIDL, {decided_mime})",
+                     "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "queue+didl"}, 200)
+
+        # Ikke-HTTP: direkte
+        sonos.play_uri(final_uri)
+        return ({"status": "Avspilling startet (direct)",
+                 "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "direct"}, 200)
+
+    except Exception as e:
+        return ({"error": str(e)}, 500)
+
+# --------------------------
+# LAST RFID-ENDPOINT
+# --------------------------
+@app.route("/last-rfid", methods=["GET"])
+@require_auth_or_local
+def last_rfid():
+    try:
+        with open("last_unmapped_rfid.txt", "r") as f:
+            last = f.read().strip()
+        return jsonify({"last_rfid": last})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --------------------------
+# HENTING AV HØYTTALERE & VALG
+# --------------------------
+def discover_speakers():
+    found = discover()
+    speakers = {}
+    if found:
+        for device in found:
+            # Hvis enheten er del av en gruppe, bruk koordinatorens navn og IP
+            coordinator = device.group.coordinator
+            if coordinator:
+                speakers[coordinator.player_name] = coordinator.ip_address
+            else:
+                speakers[device.player_name] = device.ip_address
+    return speakers
+
+@app.route("/speakers", methods=["GET"])
+@require_auth_or_local
+def get_speakers_endpoint():
+    speakers = discover_speakers()
+    return jsonify(speakers)
+
+@app.route("/set_speaker", methods=["POST"])
+@require_auth_or_local
+def set_speaker_endpoint():
+    data = request.json
+    device_id = data.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id mangler"}), 400
+
+    speakers = discover_speakers()
+    if "speaker" in data:
+        name = data["speaker"]
+        if name not in speakers:
+            return jsonify({"error": "Ukjent høyttaler"}), 400
+        chosen_ip = speakers[name]
+    elif "ip" in data:
+        chosen_ip = data["ip"]
+    else:
+        return jsonify({"error": "Mangler speaker/ip"}), 400
+
+    set_speaker_for_device(device_id, chosen_ip)
+    return jsonify({"status": "Høyttaler oppdatert", "device_id": device_id, "ip": chosen_ip})
+
+# --------------------------
+# ROUTER SOM DELEGERER TIL SERVICE-LAG
+# --------------------------
+@app.route("/play/playlink", methods=["POST"])
+@require_auth_or_local
+def play_playlink():
+    data = request.json or {}
+    device_id = data.get("device_id")
+    media = data.get("media")
+    if not device_id:
+        return jsonify({"error": "device_id mangler"}), 400
+    if not media:
+        return jsonify({"error": "media (Spotify-playlink) mangler"}), 400
+    body, code = svc_play_playlink(device_id, media)
+    return jsonify(body), code
+
+@app.route("/play/nrk_program", methods=["POST"])
+@require_auth_or_local
+def play_nrk_program():
+    data = request.json or {}
+    device_id = data.get("device_id")
+    media = data.get("media")  # For NRK-program, media tolkes som NRK-URL
+    if not device_id:
+        return jsonify({"error": "device_id mangler"}), 400
+    if not media:
+        return jsonify({"error": "media (NRK-URL) mangler i request"}), 400
+    body, code = svc_play_nrk_program(device_id, media)
+    return jsonify(body), code
+
+@app.route("/play/nrk_podcast", methods=["POST"])
+@require_auth_or_local
+def play_nrk_podcast():
+    data = request.json or {}
+    device_id = data.get("device_id")
+    media = data.get("media")  # Kan være "<slug>.xml" ELLER full episode-URL
+    if not device_id:
+        return jsonify({"error": "device_id mangler"}), 400
+    if not media:
+        return jsonify({"error": "media (XML-filnavn ELLER episode-URL) mangler i request"}), 400
+    body, code = svc_play_nrk_podcast(device_id, media)
+    return jsonify(body), code
+
+@app.route("/play/stream", methods=["POST"])
+@require_auth_or_local
+def play_stream():
+    data = request.json or {}
+    device_id = data.get("device_id")
+    uri = data.get("uri")
+    if not device_id or not uri:
+        return jsonify({"error": "device_id/uri mangler"}), 400
+    body, code = svc_play_stream(device_id, uri)
+    return jsonify(body), code
+
+# --------------------------
+# QUEUE / NAV / CONTROL
+# --------------------------
 @app.route("/queue", methods=["GET"])
 @require_auth_or_local
 def get_queue():
@@ -547,7 +668,7 @@ def get_queue():
 @app.route("/play_by_card", methods=["POST"])
 @require_auth_or_local
 def play_by_card():
-    data = request.json
+    data = request.json or {}
     device_id = data.get("device_id")
     card_id = data.get("card_id")
     if not device_id:
@@ -565,18 +686,20 @@ def play_by_card():
 
     mapping = mapping_data[card_id]
     mapping_type = mapping.get("type")
-    # Vi forventer at mapping inneholder nøkkelen "media" for alle typer
+    media = mapping.get("media")
+
     if mapping_type == "program":
-        payload = {"media": mapping.get("media"), "device_id": device_id}
-        return play_nrk_program_internal(payload)
+        body, code = svc_play_nrk_program(device_id, media)
     elif mapping_type == "podcast":
-        payload = {"media": mapping.get("media"), "device_id": device_id}
-        return play_nrk_podcast_internal(payload)
+        body, code = svc_play_nrk_podcast(device_id, media)
     elif mapping_type == "playlink":
-        payload = {"media": mapping.get("media"), "device_id": device_id}
-        return play_playlink_internal(payload)
+        body, code = svc_play_playlink(device_id, media)
+    elif mapping_type == "stream":
+        body, code = svc_play_stream(device_id, media)
     else:
         return jsonify({"error": "Ukjent mapping-type"}), 400
+
+    return jsonify(body), code
 
 @app.route("/add_mapping", methods=["POST"])
 @require_auth_or_local
@@ -613,7 +736,6 @@ def add_mapping():
         return jsonify({"status": "Mapping lagt til", "card_id": card_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @app.route("/next", methods=["POST"])
 @require_auth_or_local
@@ -662,7 +784,6 @@ def play_pause():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 @app.route("/previous", methods=["POST"])
 @require_auth_or_local
 def previous_track():
@@ -688,7 +809,6 @@ def get_mappings():
     with open("rfid_mappings.json") as f:
         data = json.load(f)
     return jsonify(data)
-
 
 # --------------------------
 # SONOS: UNGROUP (splitter alle grupper)
@@ -722,16 +842,8 @@ def ungroup_all():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
 # --------------------------
 # SONOS: GROUP (grupper navngitte høyttalere)
-# Body (JSON):
-# {
-#   "speakers": ["Edith","Sverre"],   # påkrevd, minst 2. Støtter også unik prefiks ("ed" -> "Edith")
-#   "coordinator": "Edith",           # valgfri, default = første i speakers-lista
-#   "exact": true,                    # valgfri: fjern alle andre fra gruppa til koordinator
-#   "device_id": "m5stick-123"        # valgfri: mapper denne til koordinator-IP via set_speaker_for_device()
-# }
 # --------------------------
 @app.route("/group", methods=["POST"])
 @require_auth_or_local
@@ -856,177 +968,6 @@ def group_speakers():
         "errors": errors
     })
 
-#--------------------
-# sonos (try to) play any streaming uri
-#-----------------------
-
-# --- helpers (legg disse et sted over play_stream) ---
-def _resolve_stream_url(uri: str, timeout=6) -> tuple[str, str]:
-    """Følg .pls/.m3u(.8) og HTTP-redirects. Returner (final_url, content_type_lc)."""
-    low = uri.lower()
-    if low.endswith((".pls", ".m3u", ".m3u8")):
-        r = requests.get(uri, timeout=timeout)
-        r.raise_for_status()
-        for line in r.text.splitlines():
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            if s.startswith("http://") or s.startswith("https://"):
-                uri = s
-                break
-
-    # HEAD for å finne endelig URL + Content-Type (fall back til GET om HEAD feiler)
-    try:
-        h = requests.head(uri, allow_redirects=True, timeout=timeout)
-        final = h.url
-        ctype = (h.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    except Exception:
-        g = requests.get(uri, allow_redirects=True, timeout=timeout)
-        final = g.url
-        ctype = (g.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    return final, ctype
-
-def _didl_for_stream(title: str, uri: str, mime: str) -> str:
-    # NB: bruker saxutils.escape fra din eksisterende import
-    return (
-        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" '
-        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
-        '<item id="-1" parentID="-1" restricted="true">'
-        f'<dc:title>{saxutils.escape(title)}</dc:title>'
-        '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
-        f'<res protocolInfo="http-get:*:{saxutils.escape(mime)}:*">{saxutils.escape(uri)}</res>'
-        '</item>'
-        '</DIDL-Lite>'
-    )
-
-def _sniff_magic(uri: str, timeout=6) -> str | None:
-    """
-    Returner 'ogg_vorbis' | 'ogg_opus' | 'mp3' | 'aac' | None
-    """
-    try:
-        for start in (0, 4096, 8192):
-            r = requests.get(
-                uri,
-                headers={"Range": f"bytes={start}-{start+4095}"},
-                stream=True, allow_redirects=True, timeout=timeout
-            )
-            r.raise_for_status()
-            chunk = next(r.iter_content(chunk_size=4096), b"")
-            if not chunk:
-                continue
-
-            head = chunk[:64]
-
-            # Ogg container
-            if b"OggS" in chunk:
-                if b"OpusHead" in chunk:
-                    return "ogg_opus"
-                if b"vorbis" in chunk:
-                    return "ogg_vorbis"
-                return "ogg"
-
-            # MP3: ID3 header eller MPEG frame sync 0xFFEx
-            if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
-                return "mp3"
-
-            # AAC (ADTS): sync 0xFFF1 eller 0xFFF9
-            if len(head) >= 2 and head[0] == 0xFF and head[1] in (0xF1, 0xF9):
-                return "aac"
-
-            # MP4/AAC-in-ISO (m4a/mp4) – grov sniff
-            if b"ftypM4A" in head or b"mp42" in head or b"isom" in head:
-                return "aac"
-    except Exception:
-        pass
-    return None
-
-
-@app.route("/play/stream", methods=["POST"])
-@require_auth_or_local
-def play_stream():
-    data = request.json
-    device_id = data.get("device_id")
-    uri = data.get("uri")
-    if not device_id or not uri:
-        return jsonify({"error": "device_id/uri mangler"}), 400
-
-    speaker_ip = get_speaker_for_device(device_id)
-    if not speaker_ip:
-        return jsonify({"error": "Ingen høyttaler valgt for denne device_id"}), 400
-
-    try:
-        final_uri, ctype = _resolve_stream_url(uri)
-        ctype = (ctype or "").lower()
-        ulow = final_uri.lower()
-
-        kind = _sniff_magic(final_uri)  # 'mp3' | 'aac' | 'ogg_vorbis' | 'ogg_opus' | None
-
-        # Bestem MIME vi vil annonsere i DIDL (behold 'aacp' hvis vi ser det)
-        decided_mime = None
-        if kind in ("ogg_vorbis",) or "ogg" in ctype or ulow.endswith(".ogg"):
-            decided_mime = "application/ogg"
-        elif kind == "aac" or "aac" in ctype or ulow.endswith((".aac", ".m4a", ".mp4")):
-            decided_mime = "audio/aacp" if "aacp" in ctype else "audio/aac"
-        elif kind == "mp3" or "mpeg" in ctype or "mp3" in ctype or ulow.endswith(".mp3"):
-            decided_mime = "audio/mpeg"
-        elif ctype in ("", "application/octet-stream"):
-            decided_mime = "audio/mpeg"   # safe default
-        else:
-            decided_mime = ctype
-
-        sonos = SoCo(speaker_ip)
-        sonos.stop()
-        try:
-            sonos.avTransport.EndDirectControlSession([("InstanceID", 0)])
-        except Exception:
-            pass
-        sonos.clear_queue()
-
-        # HTTP(S) – prøv radio-modus for MP3 **og AAC** først (det var dette som funket for deg)
-        if final_uri.startswith(("http://", "https://")):
-            if decided_mime in ("audio/mpeg", "audio/aac", "audio/aacp"):
-                try:
-                    sonos.play_uri(f"x-rincon-mp3radio://{final_uri}")
-                    return jsonify({
-                        "status": f"Avspilling startet (radio mode, {decided_mime})",
-                        "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "radio"
-                    })
-                except Exception:
-                    pass  # fall back til queue + DIDL
-
-            # For Ogg/AAC/annet: queue + DIDL med korrekt MIME (inkl. aacp)
-            meta = _didl_for_stream("Internet Radio", final_uri, decided_mime)
-            sonos.avTransport.AddURIToQueue([
-                ("InstanceID", 0),
-                ("EnqueuedURI", final_uri),
-                ("EnqueuedURIMetaData", meta),
-                ("DesiredFirstTrackNumberEnqueued", 0),
-                ("EnqueueAsNext", 0),
-            ])
-            sonos.play_from_queue(0, start=True)
-            return jsonify({
-                "status": f"Avspilling startet (queue + DIDL, {decided_mime})",
-                "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "queue+didl"
-            })
-
-        # Ikke-HTTP: direkte
-        sonos.play_uri(final_uri)
-        return jsonify({
-            "status": "Avspilling startet (direct)",
-            "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "direct"
-        })
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
-
-
-
-
 # --------------------------
 # SONOS: STATUS FOR ALLE HØYTTALERE
 # --------------------------
@@ -1085,8 +1026,8 @@ def players_status():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-
-
+# --------------------------
+# MAIN
+# --------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
