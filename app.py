@@ -23,7 +23,7 @@ import ipaddress
 from functools import wraps
 
 # Sett hemmeligheten her eller via env (ANBEFALT: SOCORFID_SECRET)
-SECRET = "433b0b331d345f71b094dc058c359d294d4977713091ccb40c2b7390b78a21ff42c5c7a77f5f0ff80e55ea1c597a9360ee96bd43751945f892b999564d2026e6"
+SECRET = "secret string!"
 
 # Nett som slipper auth (LAN/Tailscale m.m.)
 TRUSTED_CIDRS = [
