@@ -23,13 +23,12 @@ import ipaddress
 from functools import wraps
 
 # Sett hemmeligheten her eller via env (ANBEFALT: SOCORFID_SECRET)
-SECRET = "secret string!"
+SECRET = "secrethere"
 
 # Nett som slipper auth (LAN/Tailscale m.m.)
 TRUSTED_CIDRS = [
-    "127.0.0.0/8", "10.0.0.0/8", "192.168.0.0/16",
-    "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128",
-    "100.64.0.0/10",  # Tailscale CGNAT
+    "192.168.0.0/16",
+    "100.64.0.0/16"  # Tailscale CGNAT
 ]
 TRUSTED_NETWORKS = [ipaddress.ip_network(c) for c in TRUSTED_CIDRS]
 
@@ -102,6 +101,7 @@ def get_speaker_for_device(device_id):
 # LAST RFID-ENDPOINT
 # --------------------------
 @app.route("/last-rfid", methods=["GET"])
+@require_auth_or_local
 def last_rfid():
     try:
         with open("last_unmapped_rfid.txt", "r") as f:
@@ -633,7 +633,7 @@ def next_track():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/status")
-#@require_auth_or_local
+@require_auth_or_local
 def status():
     return "OK", 200
 
@@ -856,6 +856,91 @@ def group_speakers():
         "errors": errors
     })
 
+#--------------------
+# sonos (try to) play any streaming uri
+#-----------------------
+
+# --- helpers (legg disse et sted over play_stream) ---
+def _resolve_stream_url(uri: str, timeout=6) -> tuple[str, str]:
+    """Følg .pls/.m3u(.8) og HTTP-redirects. Returner (final_url, content_type_lc)."""
+    low = uri.lower()
+    if low.endswith((".pls", ".m3u", ".m3u8")):
+        r = requests.get(uri, timeout=timeout)
+        r.raise_for_status()
+        for line in r.text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("http://") or s.startswith("https://"):
+                uri = s
+                break
+
+    # HEAD for å finne endelig URL + Content-Type (fall back til GET om HEAD feiler)
+    try:
+        h = requests.head(uri, allow_redirects=True, timeout=timeout)
+        final = h.url
+        ctype = (h.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except Exception:
+        g = requests.get(uri, allow_redirects=True, timeout=timeout)
+        final = g.url
+        ctype = (g.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    return final, ctype
+
+def _didl_for_stream(title: str, uri: str, mime: str) -> str:
+    # NB: bruker saxutils.escape fra din eksisterende import
+    return (
+        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" '
+        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/">'
+        '<item id="-1" parentID="-1" restricted="true">'
+        f'<dc:title>{saxutils.escape(title)}</dc:title>'
+        '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
+        f'<res protocolInfo="http-get:*:{saxutils.escape(mime)}:*">{saxutils.escape(uri)}</res>'
+        '</item>'
+        '</DIDL-Lite>'
+    )
+
+def _sniff_magic(uri: str, timeout=6) -> str | None:
+    """
+    Returner 'ogg_vorbis' | 'ogg_opus' | 'mp3' | 'aac' | None
+    """
+    try:
+        for start in (0, 4096, 8192):
+            r = requests.get(
+                uri,
+                headers={"Range": f"bytes={start}-{start+4095}"},
+                stream=True, allow_redirects=True, timeout=timeout
+            )
+            r.raise_for_status()
+            chunk = next(r.iter_content(chunk_size=4096), b"")
+            if not chunk:
+                continue
+
+            head = chunk[:64]
+
+            # Ogg container
+            if b"OggS" in chunk:
+                if b"OpusHead" in chunk:
+                    return "ogg_opus"
+                if b"vorbis" in chunk:
+                    return "ogg_vorbis"
+                return "ogg"
+
+            # MP3: ID3 header eller MPEG frame sync 0xFFEx
+            if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+                return "mp3"
+
+            # AAC (ADTS): sync 0xFFF1 eller 0xFFF9
+            if len(head) >= 2 and head[0] == 0xFF and head[1] in (0xF1, 0xF9):
+                return "aac"
+
+            # MP4/AAC-in-ISO (m4a/mp4) – grov sniff
+            if b"ftypM4A" in head or b"mp42" in head or b"isom" in head:
+                return "aac"
+    except Exception:
+        pass
+    return None
 
 
 @app.route("/play/stream", methods=["POST"])
@@ -866,10 +951,31 @@ def play_stream():
     uri = data.get("uri")
     if not device_id or not uri:
         return jsonify({"error": "device_id/uri mangler"}), 400
+
     speaker_ip = get_speaker_for_device(device_id)
     if not speaker_ip:
         return jsonify({"error": "Ingen høyttaler valgt for denne device_id"}), 400
+
     try:
+        final_uri, ctype = _resolve_stream_url(uri)
+        ctype = (ctype or "").lower()
+        ulow = final_uri.lower()
+
+        kind = _sniff_magic(final_uri)  # 'mp3' | 'aac' | 'ogg_vorbis' | 'ogg_opus' | None
+
+        # Bestem MIME vi vil annonsere i DIDL (behold 'aacp' hvis vi ser det)
+        decided_mime = None
+        if kind in ("ogg_vorbis",) or "ogg" in ctype or ulow.endswith(".ogg"):
+            decided_mime = "application/ogg"
+        elif kind == "aac" or "aac" in ctype or ulow.endswith((".aac", ".m4a", ".mp4")):
+            decided_mime = "audio/aacp" if "aacp" in ctype else "audio/aac"
+        elif kind == "mp3" or "mpeg" in ctype or "mp3" in ctype or ulow.endswith(".mp3"):
+            decided_mime = "audio/mpeg"
+        elif ctype in ("", "application/octet-stream"):
+            decided_mime = "audio/mpeg"   # safe default
+        else:
+            decided_mime = ctype
+
         sonos = SoCo(speaker_ip)
         sonos.stop()
         try:
@@ -877,10 +983,49 @@ def play_stream():
         except Exception:
             pass
         sonos.clear_queue()
-        sonos.play_uri(uri)
-        return jsonify({"status": "Avspilling startet", "uri": uri})
+
+        # HTTP(S) – prøv radio-modus for MP3 **og AAC** først (det var dette som funket for deg)
+        if final_uri.startswith(("http://", "https://")):
+            if decided_mime in ("audio/mpeg", "audio/aac", "audio/aacp"):
+                try:
+                    sonos.play_uri(f"x-rincon-mp3radio://{final_uri}")
+                    return jsonify({
+                        "status": f"Avspilling startet (radio mode, {decided_mime})",
+                        "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "radio"
+                    })
+                except Exception:
+                    pass  # fall back til queue + DIDL
+
+            # For Ogg/AAC/annet: queue + DIDL med korrekt MIME (inkl. aacp)
+            meta = _didl_for_stream("Internet Radio", final_uri, decided_mime)
+            sonos.avTransport.AddURIToQueue([
+                ("InstanceID", 0),
+                ("EnqueuedURI", final_uri),
+                ("EnqueuedURIMetaData", meta),
+                ("DesiredFirstTrackNumberEnqueued", 0),
+                ("EnqueueAsNext", 0),
+            ])
+            sonos.play_from_queue(0, start=True)
+            return jsonify({
+                "status": f"Avspilling startet (queue + DIDL, {decided_mime})",
+                "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "queue+didl"
+            })
+
+        # Ikke-HTTP: direkte
+        sonos.play_uri(final_uri)
+        return jsonify({
+            "status": "Avspilling startet (direct)",
+            "uri": final_uri, "ctype": ctype, "sniff": kind, "decided_mime": decided_mime, "mode": "direct"
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+
+
+
+
 
 # --------------------------
 # SONOS: STATUS FOR ALLE HØYTTALERE
