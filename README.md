@@ -15,3 +15,4 @@ What it controls is;
 Updated with bearer auth (and IP whitelist with no auth), as well as possibility to play specific episodes from NRK podcasts based on a sharelink, and not just the whole show)
 
 Feel free to ask questions here: **[#sonosremotes:vibb.me](https://matrix.to/#/#sonosremotes:vibb.me)**          
+  
